@@ -1,3 +1,25 @@
 # Paperclip
 paperclip.jar
 cache
+
+# Everyone needs to accept the EULA seperately
+eula.txt
+
+## Data ##
+
+# players
+ops.json
+banned-ips.json
+banned-players.json
+usercache.json
+whitelist.json
+
+# Worlds
+world*
+
+## Logs ##
+logs
+.console_history
+
+# This is a form of logging
+version_history.json
