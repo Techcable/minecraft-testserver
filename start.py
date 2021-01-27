@@ -232,7 +232,7 @@ def run_server(ctx, ram):
     print()
     # TODO: Handle Interrupts
     run([ctx.jvm.java_bin, f"-Xms{ram}", f"-Xmx{ram}", *JVM_FLAGS,
-        "-jar", "paperclip.jar"],
+        "-jar", "paperclip.jar", "--nogui"],
           cwd="server")
 
 if __name__ == "__main__":
