@@ -1,0 +1,17 @@
+[EssentialsX]
+version = "2.18.2"
+description = "The bare essentials ;)"
+# URL pattern is repeated for each jar
+url = "https://github.com/EssentialsX/Essentials/releases/download/{version}/{jar_name}-{version}.0.jar"
+
+# NOTE: Essentials has multiple Jars
+jars = ["EssentialsX", "EssentialsXChat", "EssentialsXSpawn"]
+
+[WorldEdit]
+version = "7.2.2"
+manual-download = true
+
+[Debuggery]
+version = "1.2.0"
+# URL is a *pattern*
+url = "https://github.com/zachbr/Debuggery/releases/download/v{version}/Debuggery-{version}.jar"
