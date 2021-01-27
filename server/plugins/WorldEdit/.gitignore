@@ -1,0 +1,8 @@
+# TODO: Should we ignore `schematics`?
+
+# What is this and why isn't it packed into the jar?
+.archive-unpack
+
+# Data
+assets
+sessions
