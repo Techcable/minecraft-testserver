@@ -1,0 +1,8 @@
+# Internal use
+items.json
+
+# Whether or not a user has done upgrades is specific to their environment
+upgrades-done.yml
+
+# Warps are server-specific
+warps
