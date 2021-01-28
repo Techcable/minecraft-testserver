@@ -59,6 +59,7 @@ JVM_FLAGS: tuple[str] = ("-XX:+UnlockExperimentalVMOptions",
 # I have a SSD and high memory pressure, so does this apply to me?
 "-XX:+PerfDisableSharedMem")
 
+YOURKIT_PATH = Path("/opt/yourkit/bin/linux-x86-64/libyjpagent.so")
 JAVAC_VERSION_PATTERN = re.compile("^javac (1.(\d+)\.\S+|(\d+)\.[\S\.]+)$")
 
 @dataclass(frozen=True, order=True)
@@ -213,8 +214,9 @@ def update_plugins(ignores: list[str], force: bool):
 
 @server.command('run')
 @click.option('--ram', help="The amount of RAM to use", default='1G')
+@click.option('--yourkit', is_flag=True, help="Attach a yourkit profiling agent")
 @click.pass_context
-def run_server(ctx, ram):
+def run_server(ctx, ram, yourkit):
     """Actually runs the server"""
     ctx.jvm = ctx.parent.jvm # This should auto-inherit -_-
     # Ensure all plugins exist
@@ -224,6 +226,14 @@ def run_server(ctx, ram):
             config.check()
         except plugins.PluginError as e:
             raise ClickException(e)
+    java_args = [ctx.jvm.java_bin, f"-Xms{ram}", f"-Xmx{ram}"]
+    if yourkit:
+        if not YOURKIT_PATH.is_file():
+            raise ClickException(f"Missing yourkit profiler: {YOURKIT_PATH}")
+        java_args.append(f"-agentpath:{YOURKIT_PATH}=exceptions=disable,delay=10000")
+    # Extend with the JVM flags
+    java_args.extend(JVM_FLAGS)
+    java_args.extend(("-jar", "paperclip.jar", "--nogui"))
     print(f"Minecraft version: {minecraft_version()}")
     print(f"Server version: {paper_version()}")
     # This is good enough for now :)
@@ -231,9 +241,7 @@ def run_server(ctx, ram):
     print()
     print()
     # TODO: Handle Interrupts
-    run([ctx.jvm.java_bin, f"-Xms{ram}", f"-Xmx{ram}", *JVM_FLAGS,
-        "-jar", "paperclip.jar", "--nogui"],
-          cwd="server")
+    run(java_args, cwd="server")
 
 if __name__ == "__main__":
     server()
