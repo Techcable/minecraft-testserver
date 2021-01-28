@@ -8,3 +8,6 @@ upgrades-done.yml
 
 # Warps are server-specific
 warps
+
+# Spawn is actually data
+spawn.yml
