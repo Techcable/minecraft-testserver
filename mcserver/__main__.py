@@ -1,24 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
 import sys
-
-if sys.version_info[:2] < (3, 9):
-    print("Requires at least Python 3.9,",
-          f"not {sys.version_info[:2]}", file=sys.stderr)
-    sys.exit(2)
-try:
-    import click
-except ImportError:
-    print("Missing required dependency: click", file=sys.stderr)
-    sys.exit(2)
-try:
-    import toml
-except ImportError:
-    print("Missing required dependency: toml", file=sys.stderr)
-    sys.exit(2)
-
-
-from click import ClickException
 import re
 from os import PathLike
 from pathlib import Path
@@ -27,8 +10,12 @@ from dataclasses import dataclass, field
 import io
 from zipfile import ZipFile, BadZipFile
 
-import plugins
-from plugins import PluginConfig
+import click
+import toml
+from click import ClickException
+
+from . import plugins
+from .plugins import PluginConfig
 
 DEFAULT_MEMORY: str = "1G"
 
@@ -243,5 +230,4 @@ def run_server(ctx, ram, yourkit):
     # TODO: Handle Interrupts
     run(java_args, cwd="server")
 
-if __name__ == "__main__":
-    server()
+server()
