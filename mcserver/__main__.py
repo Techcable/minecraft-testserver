@@ -15,7 +15,7 @@ import toml
 import pygit2
 from click import ClickException
 
-from . import plugins, DevelopmentJar, CacheInvalidationException, MinecraftVersion, OfficialPaperJar, JvmVersion
+from . import plugins, DevelopmentJar, CacheInvalidationException, MinecraftVersion, OfficialPaperJar, JvmVersion, PaperJar
 from .plugins import PluginConfig
 
 DEFAULT_MEMORY: str = "1G"
@@ -73,7 +73,15 @@ def colorize(target: str, *, color: Optional[str], bold: bool = False, underline
         return target
     return f"\033[{';'.join(parts)}m{target}\033[0m"  
 
-@click.group(invoke_without_command=True)
+def print_wrapped(text: str, *, indent: int = 0):
+    click.echo(click.wrap_text(
+        text,
+        width=click.get_terminal_size()[0] - 4,
+        initial_indent=' ' * 4,
+        subsequent_indent=' ' * 4
+    ))
+
+@click.group()
 @click.option('--jvm', help="The desired JVM version")
 @click.pass_context
 def minecraft(ctx: Context, jvm):
@@ -137,8 +145,8 @@ def update_plugins(ignores: list[str], force: bool):
             if not refresh:
                 print(f"  - Already exists: {jar}")
 
-
-@minecraft.group('run')
+# NOTE: This is a workaround for the subcommands not working right -_-
+@minecraft.group('run', invoke_without_command=True)
 @click.option('--ram', help="The amount of RAM to use", default='1G')
 @click.option('--yourkit', is_flag=True, help="Attach a yourkit profiling agent")
 @click.option('--dry-run', is_flag=True, help="Do a dry run, compiling and printing startup flags without actually running")
@@ -156,11 +164,14 @@ def run_server(ctx, ram, yourkit, dry_run, minecraft_version):
     # Extend with the JVM flags
     java_args.extend(JVM_FLAGS)
     ctx.java_args = java_args
-    ctx.dry_run = dry_run
     try:
        ctx.minecraft_version = MinecraftVersion(minecraft_version)
     except ValueError:
         raise ClickException(f"Invalid minecraft version: {minecraft_version!r}")
+    if ctx.invoked_subcommand is None:
+        print()
+        print("No command specified!")
+        click.echo(ctx.get_help())
 
 @run_server.command('dev')
 @click.option('--recompile', '-r', is_flag=True, help="Recompile the jar")
@@ -171,12 +182,13 @@ def run_server(ctx, ram, yourkit, dry_run, minecraft_version):
 @click.pass_context
 def run_dev(ctx, repo):
     """Run the development server, compiling as needed"""
+    requested_minecraft_version = ctx.parent.minecraft_version
     try:
         jar = DevelopmentJar.from_repo(repo)
     except pygit2.GitError:
         raise ClickException(f"Invalid git repository: {repo}")
-    if jar.minecraft_version != ctx.minecraft_version:
-        raise ClickException(f"Detected version {jar.minecraft_version} for {repo} (expected {ctx.minecraft_version})")
+    if jar.minecraft_version != requested_minecraft_version:
+        raise ClickException(f"Detected version {jar.minecraft_version} for {repo} (expected {requested_minecraft_version})")
     should_recompile = None
     if recompile:
         try:
@@ -211,7 +223,7 @@ def run_dev(ctx, repo):
                 print()
         print()
         jar.run_resolve()
-    return jar.resolved_path
+    return jar
 
 @run_server.command()
 @click.option('--build-number', '--build', type=int, help="Explicitly specify the build to use")
@@ -219,35 +231,40 @@ def run_dev(ctx, repo):
 def official(ctx, build_number):
     """Run the latest build of the official server"""
     # TODO: Cache API calls to be nice too kashike and the gang
-    known_builds = ctx.minecraft_version.known_paper_builds()
+    minecraft_version = ctx.parent.minecraft_version
+    known_builds = minecraft_version.known_paper_builds
     if not known_builds:
         raise ClickException()
-    if build_number not in known_names:
-        print(f"Known builds for {ctx.minecraft_version}:", file=sys.stderr)
-        for build in sorted(known_builds):
-            print(' ' * 4, build, sep='', file=sys.stderr)
-        raise ClickException(f"Build {build_number} is not a valid build for {ctx.minecraft_version}")
-    latest_build = max(known_paper_builds)
+    if build_number is None:
+        build_number = max(known_builds)
+    if build_number not in known_builds:
+        print(f"Known builds for {minecraft_version}:", file=sys.stderr)
+        print_wrapped(', '.join(map(str, known_builds)))
+        raise ClickException(f"Build {build_number} is not a valid build for {minecraft_version}")
+    latest_build = max(known_builds)
     if build_number != latest_build:
-        click.echo(f"The latest build for {ctx.minecraft_version} is {latest_build}.")
+        click.echo(f"The latest build for {minecraft_version} is {latest_build}.")
         click.confirm(f"Are you sure you want to use {build_number} instead?", abort=True)
-    jar = OfficialPaperJar(ctx.minecraft_version, build)
+    jar = OfficialPaperJar(minecraft_version, build_number)
     try:
         jar.validate_cache()
     except CacheInvalidationException as e:
-        e.show()
+        e.print("Paper jar")
         print()
-        print("Downloading Paper {build_number}....")
-        jar.run_resolve()
+        print(f"Downloading Paper {build_number}....")
+        jar.update()
     assert jar.resolved_path.exists()
-    return jar.resolved_path
+    return jar
 
 
 
 @run_server.resultcallback()
 @click.pass_context
-def process_run(desired_jar: Path, ctx):
+def process_run(ctx, desired_jar: PaperJar, *, dry_run: bool, **kwargs):
     # Ensure all plugins exist
+    assert isinstance(desired_jar, PaperJar), f"Given jar: {desired_jar!r}"
+    assert isinstance(ctx, click.Context)
+    assert desired_jar.resolved_path.exists()
     print("Checking plugins...")
     for config in load_plugin_configs():
         try:
@@ -255,23 +272,20 @@ def process_run(desired_jar: Path, ctx):
         except plugins.PluginError as e:
             raise ClickException(e)
     java_args = ctx.java_args
-    print(f"Minecraft version: {minecraft_version()}")
-    print(f"Server version: {paper_version()}")
-    if ctx.dry_run:
+    print(f"Minecraft version: {ctx.minecraft_version}")
+    print(f"Server version: {desired_jar.describe()}")
+    if dry_run:
         print("NOTE: This was a 'dry run'. Not actually starting server")
-        print(f"Desired jar: {desired_jar}")
+        print(f"Desired jar path: {desired_jar.resolved_path}")
         print()
-        print(f"Arguments for {ctx.jvm_bin}:")
-        split = []
-        for i in range(0, len(java_args), 10):
-            split = java_args[i:i + 10]
-            print(' ' * 4, ', '.join(split), sep = '')
+        print(f"Arguments for {ctx.jvm.java_bin}:")
+        print_wrapped(', '.join(java_args))
         return
     # This is good enough for now :)
     print("Beginning server....")
     print()
     print()
     # TODO: Handle Interrupts
-    run([ctx.jvm.java_bin, *ctx.java_args, "-jar", desired_jar, "--nogui"], cwd="server")
+    run([ctx.jvm.java_bin, *ctx.java_args, "-jar", desired_jar.resolved_path, "--nogui"], cwd="server")
 
 minecraft()

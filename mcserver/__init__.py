@@ -130,6 +130,9 @@ class MinecraftVersion:
     def __str__(self) -> str:
         return self.name
 
+    def __hash__(self) -> int:
+        return hash(self.name)
+
     def __eq__(self, other: MinecraftVersion):
         if isinstance(other, MinecraftVersion):
             return self.name == other.name
@@ -145,7 +148,7 @@ class MinecraftVersion:
     @cached_property
     def known_paper_builds(self) -> list[int]:
         # See API definition: https://papermc.io/api/
-        response = requests.get(f"https://papermc.io/api/v2/projects/paper/versions/{minecraft_version}/")
+        response = requests.get(f"https://papermc.io/api/v2/projects/paper/versions/{self}/")
         response.raise_for_status()
         data = response.json()
         return data['builds']
@@ -161,6 +164,14 @@ class MinecraftVersion:
         data = response.json()
         return [MinecraftVersion(name) for name in data['versions'] if MinecraftVersion.is_valid(name)]
 
+    @cache
+    def fetch_paper_build(self, build_number: int) -> BuildInfo:
+        response = requests.get(f"https://papermc.io/api/v2/projects/paper/versions/{self}/builds/{build_number}")
+        response.raise_for_status()
+        data = response.json()
+        parsed = BuildInfo.parse(data)
+        assert parsed.project_id == "paper"
+        return parsed
 
 
 class PaperVersionException(Exception):
@@ -189,14 +200,13 @@ class BuildInfo:
     """The hash of the download, in SHA256 hex"""
 
     @contextmanager
-    def open_download(self) -> io.IOBase:
+    def iter_download(self) -> Iterator[bytes]:
         url = f"https://papermc.io/api/v2/projects/{self.project_id}/versions/{self.minecraft_version}/builds/" \
                 f"{self.build_number}/downloads/{self.download_name}"
         with requests.get(url, stream=True) as response:
             response.raise_for_status()
-            with response.iter_content(chunk_size=1024) as data:
-                # This is the data they are going to iterate over
-                yield data
+            # This is the data they are going to iterate over
+            yield response.iter_content(chunk_size=4096)
 
     @staticmethod
     def parse(json: Any) -> BuildInfo:
@@ -210,14 +220,6 @@ class BuildInfo:
             download_name=json['downloads']['application']['name'],
             download_hash=json['downloads']['application']['sha256']
         )
-
-    @staticmethod
-    @cache
-    def fetch(minecraft_version: MinecraftVersion, build_number: int) -> BuildInfo:
-        response = requests.get(f"https://papermc.io/api/v2/projects/paper/versions/{minecraft_version}/")
-        response.raise_for_status()
-        data = response.json()
-        return data['builds']
 
     def __str__(self):
         return f"{self.project_name}-{self.build_number}"
@@ -381,15 +383,15 @@ class OfficialPaperJar(PaperJar):
                 )
         # Next, validate the cached jar
         if not self.resolved_path.exists():
-            raise PaperVersionException(f"Missing downloaded for {self.describe()}")
+            raise CacheInvalidationException(f"Missing downloaded for {self.describe()}")
         # I guess we're going to validate the hash??
         #
         # TODO: Why are we doing this?
         try:
             actual_jar_hash = hash_file(self.resolved_path)
-        except FileNotfoundError:
+        except FileNotFoundError:
             raise CacheInvalidationException(f"Missing build {self.build_number} for {self.minecraft_version}")
-        expected_jar_hash = BuildInfo.fetch(self.minecraft_version, self.build_number).download_hash
+        expected_jar_hash = self.minecraft_version.fetch_paper_build(self.build_number).download_hash
         if actual_jar_hash != expected_jar_hash:
             raise CacheInvalidationException(
                 summary=f"Mismatched hash for {self.describe()}", full_message=(
@@ -398,14 +400,15 @@ class OfficialPaperJar(PaperJar):
                 )
             )
 
-    def run_resolve(self, *, force: bool = False):
+    def update(self, *, force: bool = False):
         if not force and self.resolved_path.exists():
             return
-        info = BuildInfo.fetch(self.minecraft_version, self.build_number)
-        with info.open_download() as download:
+        info = self.minecraft_version.fetch_paper_build(self.build_number)
+        with info.iter_download() as download:
             self.resolved_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.resolved_path, 'wb') as file:
-                shutil.copyfileobj(download, file)
+                for chunk in download:
+                    file.write(chunk)
         assert hash_file(self.resolved_path) == info.download_hash
 
     def describe(self):
@@ -468,7 +471,7 @@ class DevelopmentJar(PaperJar):
         self.validate_cache()
         return None
 
-    def run_resolve(self, *, force: bool = False):
+    def update(self, *, force: bool = False):
         if not force and self.check_valid_cached_jar():
             # The already compiled jar is valid
             # No need to recompile
@@ -640,7 +643,7 @@ class CacheInvalidationException(PaperVersionException):
 def hash_file(target: Path, *, recurse_dir: bool = False) -> str:
     m = hashlib.sha256()
     try:
-        with open(changed, 'rb') as f:
+        with open(target, 'rb') as f:
             while (buffer := f.read(4096)):
                 m.update(buffer)
     except IsADirectoryError:
