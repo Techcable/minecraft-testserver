@@ -206,7 +206,7 @@ class BuildInfo:
         with requests.get(url, stream=True) as response:
             response.raise_for_status()
             # This is the data they are going to iterate over
-            yield response.iter_content(chunk_size=4096)
+            yield response.iter_content(chunk_size=8192)
 
     @staticmethod
     def parse(json: Any) -> BuildInfo:
@@ -500,7 +500,7 @@ class DevelopmentJar(PaperJar):
         craftbukkit_pom = Path(path, 'pom.xml')
         minecraft_version = None
         try:
-            with open() as f:
+            with open(craftbukkit_pom, 'rt') as f:
                 start_tag = '<minecraft.version>'
                 for line in f:
                     index = line.find(start_tag)
