@@ -20,5 +20,10 @@ function requireDependency() {
 requireMinorVersion 9
 requireDependency click
 requireDependency toml
+requireDependency requests
+# We use this for git integration ^_^
+# I like libgit2
+requireDependency pygit2
+
 
 python3 -m mcserver

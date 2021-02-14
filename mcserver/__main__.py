@@ -12,9 +12,10 @@ from zipfile import ZipFile, BadZipFile
 
 import click
 import toml
+import pygit2
 from click import ClickException
 
-from . import plugins
+from . import plugins, DevelopmentJar, CacheInvalidationException, MinecraftVersion, OfficialPaperJar, JvmVersion
 from .plugins import PluginConfig
 
 DEFAULT_MEMORY: str = "1G"
@@ -46,116 +47,53 @@ JVM_FLAGS: tuple[str] = ("-XX:+UnlockExperimentalVMOptions",
 # I have a SSD and high memory pressure, so does this apply to me?
 "-XX:+PerfDisableSharedMem")
 
-YOURKIT_PATH = Path("/opt/yourkit/bin/linux-x86-64/libyjpagent.so")
-JAVAC_VERSION_PATTERN = re.compile("^javac (1.(\d+)\.\S+|(\d+)\.[\S\.]+)$")
+_ANSI_COLOR_CODES = {
+    "black": 0,
+    "red": 1,
+    "green": 2,
+    "yellow": 3,
+    "blue": 4,
+    "magenta": 5,
+    "cyan": 6,
+    "white": 7
+}
+def colorize(target: str, *, color: Optional[str], bold: bool = False, underline: bool = False):
+    # TODO: Replace with click.style
+    if os.name != 'posix' and sys.platform != 'cygwin':
+        # No ANSI color codes here :(
+        return target
+    parts = []
+    if color is not None:
+        parts.append(str(30 + _ANSI_COLOR_CODES[color]))
+    if bold:
+        parts.append("1")
+    if underline:
+        parts.append("4")
+    if not parts:
+        return target
+    return f"\033[{';'.join(parts)}m{target}\033[0m"  
 
-@dataclass(frozen=True, order=True)
-class JvmVersion:
-    # NOTE: Do not want path to affect version ordering
-    base_path: Path = field(compare=False)
-    number: int
-    """Major version number"""
-    version: str
-    """Full version name"""
-
-    @property
-    def executable(self) -> Path:
-        return Path(self.base_path, "bin/java")
-
-    @staticmethod
-    def detect_from_dir(base_path: Path) -> JvmVersion:
-        javac = Path(base_path, "bin/javac")
-        if not javac.exists():
-            raise ClickException(f"Unable to find javac: {javac}")
-        proc = run([javac, "-version"], encoding='utf-8', stdout=PIPE, stderr=PIPE, check=True)
-        raw_version = proc.stdout.strip() or proc.stderr.strip()
-        match = JAVAC_VERSION_PATTERN.match(raw_version)
-        if not match:
-            raise ClickException(f"Unable to match javac version: {raw_version!r}")
-        full_name = match[1]
-        number = int(match[2] or match[3])
-        return JvmVersion(base_path=base_path, number=number, version=full_name)
-
-    @property
-    def java_bin(self) -> Path:
-        return Path(self.base_path, "bin/java")
-
-    @staticmethod
-    def detect_all() -> list[JvmVersion]:
-        jvm_dir = Path("/usr/lib/jvm")
-        if not jvm_dir.exists():
-            raise ClickException("Unable to search for JVMs in {jvm_dir}")
-        res = []
-        for sub_dir in jvm_dir.iterdir():
-            if sub_dir.is_symlink() or sub_dir.is_file():
-                continue
-            res.append(JvmVersion.detect_from_dir(sub_dir))
-        if not res:
-            raise ClickException("Didn't find any JVMs in {jvm_dir}")
-        return res
-
-    def __eq__(self, other):
-        # Must override since excluded from comparison
-        return isinstance(other, JvmVersion) and \
-                  (self.path == other.path) and \
-                  (self.number == other.number) and \
-                  (self.name == other.name)
-
-    def __ne__(self, other):
-         return not (self == other)
-
-    def run_simple(self, args: list[str], *, cwd: PathLike) -> str:
-         return run([self.java_bin, *args], cwd=cwd, stdout=PIPE,
-                    stderr=DEVNULL, encoding='utf-8', check=True).stdout
-
-AVAILABLE_JVM_VERSIONS = JvmVersion.detect_all()
-DEFAULT_JVM_VERSION = max(AVAILABLE_JVM_VERSIONS)
-
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option('--jvm', help="The desired JVM version")
 @click.pass_context
-def server(ctx: Context, jvm):
+def minecraft(ctx: Context, jvm):
     """Manages a minecraft server for you"""
     ctx.ensure_object(Context)
-    considered_jvm_versions = AVAILABLE_JVM_VERSIONS
+    considered_jvm_versions = JvmVersion.detect_all()
     if jvm:
         try:
             desired_jvm_version = int(jvm)
         except ValueError:
             raise ClickException("Unknown JVM version: {jvm!r}")
-        considered_jvm_versions = [jvm for jvm in AVAILABLE_JVM_VERSIONS if ctx.jvm.version == desired_jvm_version]
+        considered_jvm_versions = [jvm for jvm in JvmVersion.detect_all() if ctx.jvm.version == desired_jvm_version]
         if not considered_jvm_versions:
             raise ClickException("Unknown JVM version: {jvm!r}")
         ctx.jvm = max(considered_jvm_versions)
     else:
-        ctx.jvm = DEFAULT_JVM_VERSION
+        ctx.jvm = JvmVersion.default()
     if len(considered_jvm_versions) > 1:
         print("Considered JVM versions:", ', '.join(set(jvm.version for jvm in considered_jvm_versions)))
     print(f"Using JVM version {ctx.jvm.version} from {ctx.jvm.base_path!r}")
-
-_CACHED_PAPER_VERSION: str = None
-def paper_version() :
-    global _CACHED_PAPER_VERSION
-    return _CACHED_PAPER_VERSION or (_CACHED_PAPER_VERSION := DEFAULT_JVM_VERSION\
-              .run_simple(["-jar", "paperclip.jar", "-version"], cwd='server').strip())
-
-_CACHED_MINECRAFT_VERSION: str = None
-def minecraft_version() -> str:
-    global _CACHED_MINECRAFT_VERSION
-    if _CACHED_MINECRAFT_VERSION is not None:
-        return _CACHED_MINECRAFT_VERSION
-    try:
-        with ZipFile('server/paperclip.jar') as z:
-            with io.TextIOWrapper(z.open("patch.properties")) as f:
-                for line in f:
-                    line = line.strip()
-                    match = re.match("^version=(.*)", line)
-                    if match is not None:
-                        _CACHED_MINECRAFT_VERSION = match[1]
-                        return match[1]
-                raise ValueError("Unable to match 'version'")
-    except (BadZipFile, IOError, ValueError):
-        raise ClickException("Unable to detect MC version from paperclip.jar")
 
 _CACHED_PLUGIN_CONFIGS = None
 def load_plugin_configs() -> list[PluginConfig]:
@@ -175,7 +113,7 @@ def load_plugin_configs() -> list[PluginConfig]:
 class Context:
     jvm: JvmVersion
 
-@server.command()
+@minecraft.command()
 @click.option('--force', is_flag=True, default=False, help="Forcibly downloads, even if alreay exists")
 @click.option('--ignore', 'ignores', help="A plugin to ignore", multiple=True)
 def update_plugins(ignores: list[str], force: bool):
@@ -199,13 +137,116 @@ def update_plugins(ignores: list[str], force: bool):
             if not refresh:
                 print(f"  - Already exists: {jar}")
 
-@server.command('run')
+
+@minecraft.group('run')
 @click.option('--ram', help="The amount of RAM to use", default='1G')
 @click.option('--yourkit', is_flag=True, help="Attach a yourkit profiling agent")
+@click.option('--dry-run', is_flag=True, help="Do a dry run, compiling and printing startup flags without actually running")
+@click.option('--minecraft-version', '--mc', default=str(max(MinecraftVersion.list_all())),
+    help="The minecraft version to run (defaults to latest)")
 @click.pass_context
-def run_server(ctx, ram, yourkit):
+def run_server(ctx, ram, yourkit, dry_run, minecraft_version):
     """Actually runs the server"""
     ctx.jvm = ctx.parent.jvm # This should auto-inherit -_-
+    java_args = [f"-Xms{ram}", f"-Xmx{ram}"]
+    if yourkit:
+        if not YOURKIT_PATH.is_file():
+            raise ClickException(f"Missing yourkit profiler: {YOURKIT_PATH}")
+        java_args.append(f"-agentpath:{YOURKIT_PATH}=exceptions=disable,delay=10000")
+    # Extend with the JVM flags
+    java_args.extend(JVM_FLAGS)
+    ctx.java_args = java_args
+    ctx.dry_run = dry_run
+    try:
+       ctx.minecraft_version = MinecraftVersion(minecraft_version)
+    except ValueError:
+        raise ClickException(f"Invalid minecraft version: {minecraft_version!r}")
+
+@run_server.command('dev')
+@click.option('--recompile', '-r', is_flag=True, help="Recompile the jar")
+@click.option(
+    '--repo', type=click.Path(exists=True, file_okay=False),
+    default=str(Path(Path.home(), "git/Paper")), help="The path to the paper repository"
+)
+@click.pass_context
+def run_dev(ctx, repo):
+    """Run the development server, compiling as needed"""
+    try:
+        jar = DevelopmentJar.from_repo(repo)
+    except pygit2.GitError:
+        raise ClickException(f"Invalid git repository: {repo}")
+    if jar.minecraft_version != ctx.minecraft_version:
+        raise ClickException(f"Detected version {jar.minecraft_version} for {repo} (expected {ctx.minecraft_version})")
+    should_recompile = None
+    if recompile:
+        try:
+            jar.validate_cache()
+        except CacheInvalidationException as e:
+            # Tell them that the cache is invalid, assuring them
+            # it's reasonable for them to recompile
+            e.print("Paper development jar", include_full=False)
+        else:
+            print("NOTE: The cached paper development jar is already up to date.")
+            click.confirm("Are you sure you want to recompile?", abort=True)
+        should_recompile = True
+    else:
+        try:
+            jar.validate_cache()
+        except CacheInvalidationException as e:
+            # Tell them the cache is invalid
+            e.print("Paper development jar")
+            should_recompile = True
+        else:
+            should_recompile = False
+    if should_recompile:
+        target_commit = jar.describe_commit("HEAD")
+        print('*' * click.get_terminal_size()[0])
+        print(f"Compiling commit {colorize(target_commit.short_id, underline=True)}:")
+        for index, line in enumerate(target_commit.message.splitlines()):
+            if index == 0:
+                print(' ' * 4, colorize(line, bold=True), sep='')
+            elif line and not line.isspace():
+                print(' ' * 4, line, sep='')
+            else:
+                print()
+        print()
+        jar.run_resolve()
+    return jar.resolved_path
+
+@run_server.command()
+@click.option('--build-number', '--build', type=int, help="Explicitly specify the build to use")
+@click.pass_context
+def official(ctx, build_number):
+    """Run the latest build of the official server"""
+    # TODO: Cache API calls to be nice too kashike and the gang
+    known_builds = ctx.minecraft_version.known_paper_builds()
+    if not known_builds:
+        raise ClickException()
+    if build_number not in known_names:
+        print(f"Known builds for {ctx.minecraft_version}:", file=sys.stderr)
+        for build in sorted(known_builds):
+            print(' ' * 4, build, sep='', file=sys.stderr)
+        raise ClickException(f"Build {build_number} is not a valid build for {ctx.minecraft_version}")
+    latest_build = max(known_paper_builds)
+    if build_number != latest_build:
+        click.echo(f"The latest build for {ctx.minecraft_version} is {latest_build}.")
+        click.confirm(f"Are you sure you want to use {build_number} instead?", abort=True)
+    jar = OfficialPaperJar(ctx.minecraft_version, build)
+    try:
+        jar.validate_cache()
+    except CacheInvalidationException as e:
+        e.show()
+        print()
+        print("Downloading Paper {build_number}....")
+        jar.run_resolve()
+    assert jar.resolved_path.exists()
+    return jar.resolved_path
+
+
+
+@run_server.resultcallback()
+@click.pass_context
+def process_run(desired_jar: Path, ctx):
     # Ensure all plugins exist
     print("Checking plugins...")
     for config in load_plugin_configs():
@@ -213,21 +254,24 @@ def run_server(ctx, ram, yourkit):
             config.check()
         except plugins.PluginError as e:
             raise ClickException(e)
-    java_args = [ctx.jvm.java_bin, f"-Xms{ram}", f"-Xmx{ram}"]
-    if yourkit:
-        if not YOURKIT_PATH.is_file():
-            raise ClickException(f"Missing yourkit profiler: {YOURKIT_PATH}")
-        java_args.append(f"-agentpath:{YOURKIT_PATH}=exceptions=disable,delay=10000")
-    # Extend with the JVM flags
-    java_args.extend(JVM_FLAGS)
-    java_args.extend(("-jar", "paperclip.jar", "--nogui"))
+    java_args = ctx.java_args
     print(f"Minecraft version: {minecraft_version()}")
     print(f"Server version: {paper_version()}")
+    if ctx.dry_run:
+        print("NOTE: This was a 'dry run'. Not actually starting server")
+        print(f"Desired jar: {desired_jar}")
+        print()
+        print(f"Arguments for {ctx.jvm_bin}:")
+        split = []
+        for i in range(0, len(java_args), 10):
+            split = java_args[i:i + 10]
+            print(' ' * 4, ', '.join(split), sep = '')
+        return
     # This is good enough for now :)
     print("Beginning server....")
     print()
     print()
     # TODO: Handle Interrupts
-    run(java_args, cwd="server")
+    run([ctx.jvm.java_bin, *ctx.java_args, "-jar", desired_jar, "--nogui"], cwd="server")
 
-server()
+minecraft()
