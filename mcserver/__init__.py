@@ -19,7 +19,6 @@ import os
 import requests
 import pygit2
 
-YOURKIT_PATH = Path("/opt/yourkit/bin/linux-x86-64/libyjpagent.so")
 JAVAC_VERSION_PATTERN = re.compile("^javac (1.(\d+)\.\S+|(\d+)\.[\S\.]+)$")
 
 class JvmException(Exception):

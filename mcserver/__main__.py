@@ -19,6 +19,9 @@ from click import ClickException
 from . import plugins, DevelopmentJar, CacheInvalidationException, MinecraftVersion, OfficialPaperJar, JvmVersion, PaperJar, DevCommit
 from .plugins import PluginConfig
 
+YOURKIT_PATH = Path("/opt/yourkit/bin/linux-x86-64/libyjpagent.so")
+"""The hardcoded path to the yourkit instance we use"""
+
 DEFAULT_MEMORY: str = "1G"
 
 # Based of Aikar's JVM flags: https://mcflags.emc.gs
