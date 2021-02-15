@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import os
 import re
 from os import PathLike
 from pathlib import Path
@@ -15,7 +16,7 @@ import toml
 import pygit2
 from click import ClickException
 
-from . import plugins, DevelopmentJar, CacheInvalidationException, MinecraftVersion, OfficialPaperJar, JvmVersion, PaperJar
+from . import plugins, DevelopmentJar, CacheInvalidationException, MinecraftVersion, OfficialPaperJar, JvmVersion, PaperJar, DevCommit
 from .plugins import PluginConfig
 
 DEFAULT_MEMORY: str = "1G"
@@ -180,7 +181,7 @@ def run_server(ctx, ram, yourkit, dry_run, minecraft_version):
     default=str(Path(Path.home(), "git/Paper")), help="The path to the paper repository"
 )
 @click.pass_context
-def run_dev(ctx, repo):
+def run_dev(ctx, repo, recompile):
     """Run the development server, compiling as needed"""
     requested_minecraft_version = ctx.parent.minecraft_version
     try:
@@ -198,8 +199,7 @@ def run_dev(ctx, repo):
             # it's reasonable for them to recompile
             e.print("Paper development jar", include_full=False)
         else:
-            print("NOTE: The cached paper development jar is already up to date.")
-            click.confirm("Are you sure you want to recompile?", abort=True)
+            print(f"{colorize('WARNING', color='magenta', bold=True)}: The cached paper development jar is already up to date.")
         should_recompile = True
     else:
         try:
@@ -211,18 +211,21 @@ def run_dev(ctx, repo):
         else:
             should_recompile = False
     if should_recompile:
-        target_commit = jar.describe_commit("HEAD")
+        target_commit = DevCommit.revparse(jar.open_repo(), "HEAD")
         print('*' * click.get_terminal_size()[0])
-        print(f"Compiling commit {colorize(target_commit.short_id, underline=True)}:")
-        for index, line in enumerate(target_commit.message.splitlines()):
+        print(f"Compiling from commit {colorize(target_commit.short_id, color=None, underline=True)}:")
+        for index, line in enumerate(target_commit.full_message.splitlines()):
             if index == 0:
-                print(' ' * 4, colorize(line, bold=True), sep='')
+                print(' ' * 4, colorize(line, color=None, bold=True), sep='')
             elif line and not line.isspace():
                 print(' ' * 4, line, sep='')
             else:
                 print()
         print()
-        jar.run_resolve()
+        click.confirm("Are you sure you want to compile this?", default=True, abort=True)
+        jar.update()
+    else:
+        print(f"Reusing existing jar")
     return jar
 
 @run_server.command()

@@ -1,5 +1,8 @@
 # By default, ignore any jars
 **.jar
 
+# Ignore internal cache
+cache
+
 # Python
 __pycache__

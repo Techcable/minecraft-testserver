@@ -6,6 +6,7 @@ from typing import Optional, Any
 import shutil
 import re
 import io
+import json
 from pathlib import Path
 from subprocess import run, CalledProcessError, PIPE
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from functools import cache, lru_cache, cached_property, total_ordering
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
 import hashlib
+import os
 
 import requests
 import pygit2
@@ -231,7 +233,7 @@ class DevCommit:
     full_message: str
 
     @staticmethod
-    def revparse(repo: pygit2.Repository, *, strict: bool = True):
+    def revparse(repo: pygit2.Repository, target_id: str, *, strict: bool = True):
         assert isinstance(repo, pygit2.Repository)
         try:
             ref = repo.revparse_single(target_id)
@@ -292,7 +294,7 @@ class DevJarSignature:
         )
 
 _MANIFEST_VERSION_PATTERN = re.compile("Implementation-Version: (\\S.*)")
-@dataclass(frozen=True)
+@dataclass
 class PaperJar(metaclass=ABCMeta):
     minecraft_version: MinecraftVersion
     """The minecraft version string"""
@@ -301,7 +303,7 @@ class PaperJar(metaclass=ABCMeta):
         """Describe the resolved version of the jar.
 
         Likely different format than the regular `describe` method."""
-        resolved = self.resolved
+        resolved = self.resolved_path
         if not resolved.exists():
             return None
         detected_version: Optional[str] = None
@@ -352,7 +354,7 @@ class PaperJar(metaclass=ABCMeta):
         pass
 
 
-@dataclass(frozen=True)
+@dataclass
 class OfficialPaperJar(PaperJar):
     build_number: int
     """The CI build number"""
@@ -419,7 +421,7 @@ class OfficialPaperJar(PaperJar):
         return Path(f"cache/official-builds/paper-{self.build_number}.jar")
 
 
-@dataclass(frozen=True)
+@dataclass
 class DevelopmentJar(PaperJar):
     git_directory: Path
     """The git directory, which may or may not be clean"""
@@ -445,9 +447,9 @@ class DevelopmentJar(PaperJar):
         # Check server and api dirs too
         # Normally these are ignored but we need to check these
         if (server_repo_path := Path(self.git_directory, "Paper-Server")).exists():
-            repos.append((Repository(str(server_repo_path)), server_repo_path))
+            repos.append((pygit2.Repository(str(server_repo_path)), server_repo_path))
         if (api_repo_path := Path(self.git_directory, "Paper-API")).exists():
-            repos.append((Repository(str(api_repo_path))), api_repo_path)
+            repos.append((pygit2.Repository(str(api_repo_path)), api_repo_path))
         changed = []
         for repo, repo_path in repos:
             for file, flags in repo.status().items():
@@ -472,32 +474,34 @@ class DevelopmentJar(PaperJar):
         return None
 
     def update(self, *, force: bool = False):
-        if not force and self.check_valid_cached_jar():
-            # The already compiled jar is valid
-            # No need to recompile
-            return
+        if not force:
+            try:
+                self.validate_cache()
+            except CacheInvalidationException:
+                pass
+            else:
+                # The already compiled jar is valid
+                # No need to recompile
+                return
         # Run recompile
         # TODO: Handle errors better?
         #
         # Technically, this is a leaky abstraction since it prints to stdout.
         # However, I really want color support and I'm probably just overthinking things ^_^
         try:
+            # TODO: Page all this output?
             run(["mvn", "clean", "package"], cwd=self.git_directory, check=True)
         except CalledProcessError as e:
             raise PaperVersionException("Unable to compile jar!") from e
-        if not self.resolved.exists():
-            raise PaperVersionException(f"Unable to find compiled jar: {self.resolved}")
-        self.save_jar_signature(DevJarSignature(
-            jar_hash=hash_file(self.resolved),
-            commit_id=self.source_commit,
-            modified_sources={p: hash_file(p, recurse_dir=True) for p in self.detect_changed_files()}
-        ))
+        if not self.resolved_path.exists():
+            raise PaperVersionException(f"Unable to find compiled jar: {self.resolved_path}")
+        self.save_jar_signature(self.detect_current_signature())
 
     @staticmethod
     def from_repo(path: Path) -> DevelopmentJar:
-        repo = Repository(path)
+        repo = pygit2.Repository(path)
         # Lets play 'detect the minecraft version'
-        craftbukkit_pom = Path(path, 'pom.xml')
+        craftbukkit_pom = Path(path, 'work/CraftBukkit/pom.xml')
         minecraft_version = None
         try:
             with open(craftbukkit_pom, 'rt') as f:
@@ -512,32 +516,34 @@ class DevelopmentJar(PaperJar):
                                 "Missing closing version tag"
                             ])
                         minecraft_version = line[index + len(start_tag):closing_index]
+                        break
         except FileNotFoundError:
-            raise PaperVersionException(f"Paper version missing CraftBukkit pom")
-        search_message = [f"Searched CraftBukkit pom at {craftbukkit_pom}"]
+            raise PaperVersionException(f"Paper repo missing CraftBukkit pom")
         if minecraft_version is None:
-            raise PaperVersionException(f"Could not detect name of minecraft version for repo", full_message=search_message)
+            raise PaperVersionException(f"Could not find minecraft version from the CraftBukkit pom: {craftbukkit_pom}")
         try:
             minecraft_version = MinecraftVersion(minecraft_version)
         except ValueError:
-            raise PaperVersionException("Invalid minecraft version", full_message=search_message)
+            raise PaperVersionException(f"Invalid minecraft version in Craftbukkit POM: {minecraft_version}")
         return DevelopmentJar(minecraft_version, path)
 
 
     def validate_cache(self):
-        compiled_jar = self.resolved
+        compiled_jar = self.resolved_path
         signature_file = self.jar_signature_path
         if self.git_directory in Path.home().parents:
             repo_name = str(self.git_directory.relative_to(Path.home()))
         else:
             repo_name = str(self.git_directory)
         if not compiled_jar.exists():
-            raise CacheInvalidationException(f"Missing compiled jar for git repo: {repo_name}")
+            raise CacheInvalidationException(f"Missing compiled jar for git repo", full_message=[
+                f"Expected location: {compiled_jar}"
+            ])
         if not signature_file.exists():
             raise CacheInvalidationException(f"Missing development jar signature: {signature_file.name}")
         # NOTE: Implicitly loads if missing
-        actual_signature = self.detect_current_signature()
         expected_signature = self.cached_jar_signature
+        actual_signature = self.detect_current_signature()
         if actual_signature.jar_hash != expected_signature.jar_hash:
             # Jar changed on disk. It is possible the user recompiled.
             # We can not know for sure what sources the user compiled with
@@ -545,10 +551,10 @@ class DevelopmentJar(PaperJar):
             # It is possible they made a change, manually compiled, and then reverted the change
             # so even if they hash the same the sources on disk do not necessarily correspond to the jar
             raise CacheInvalidationException("Compiled jar changed on disk (hash)")
-        if expected_signature.commit_id != self.current_commit:
+        if expected_signature.source_commit != self.current_commit:
             repo = self.open_rpeo()
             actual_commit = DevCommit.revparse(repo, self.current_commit, strict=False)
-            expected_commit = DevCommit.revparse(repo, expected_signature.commit_id, strict=False)
+            expected_commit = DevCommit.revparse(repo, expected_signature.source_commit, strict=False)
             raise CacheInvalidationException(f"Mismatched commits for {repo_name}", full_message=[
                 f"Expected commit {expected_commit.short_id}: {expected_commit.summary}",
                 f"Actual commit {actual_commit.short_id}: {actual_commit.summary}"
@@ -579,12 +585,12 @@ class DevelopmentJar(PaperJar):
 
     def detect_current_signature(self) -> DevJarSignature:
         return DevJarSignature(
-            jar_harh=hash_file(self.resolved),
-            commit_id=self.current_commit,
+            jar_hash=hash_file(self.resolved_path),
+            source_commit=self.current_commit,
             # NOTE: We're going to allow directories, in case they are untracked by git
             #
             # In that case, we don't respect gitignore and hash everything indiscriminately
-            modified_sources={p: hash_file(p, recurse_dir=True) for p in changed_files},
+            modified_sources={p: hash_file(Path(self.git_directory), recurse_dir=True) for p in self.detect_changed_files()},
         )
 
     @property
@@ -601,7 +607,7 @@ class DevelopmentJar(PaperJar):
         with open(self.jar_signature_path, 'wt') as f:
             json.dump(signature.save(), f)
         # Then, invalidate cache
-        del self.cached_jar_signature
+        self.cached_jar_signature = signature
 
 
     def open_repo(self) -> pygit2.Repository:
@@ -615,8 +621,8 @@ class DevelopmentJar(PaperJar):
         return descr
 
     @property
-    def resolved(self) -> Path:
-        return Path(self.git_directory, "Paper-Server/target/paper-{self.minecraft_version}.jar")
+    def resolved_path(self) -> Path:
+        return Path(self.git_directory, f"Paper-Server/target/paper-{self.minecraft_version}.jar")
 
 class CacheInvalidationException(PaperVersionException):
     full_message: tuple[str, ...]
