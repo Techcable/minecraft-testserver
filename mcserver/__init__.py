@@ -560,22 +560,11 @@ class DevelopmentJar(PaperJar):
         # the only other possible changed input is untracked/uncommited changes.
         # Check that those hashes match
         if changed_files != expected_signature.modified_sources.keys():
-            all_changed_files = changed_files | expected_signature.modified_sources.keys()
-            change_descriptions = []
-            for name in sorted(set(all_changed_files)):
-                if name not in expected_signature.modified_sources:
-                    assert name in actual_signature.modified_sources
-                    descr = "Added"
-                elif name not in actual_signature.modified_sources:
-                    assert name in expected_signature.modified_sources
-                    descr = "Removed"
-                else:
-                    descr = "Modified"
-                descr += ":"
-                change_descriptions.append(f"{descr:10} {name}")
+            all_changed_files = sorted(set(changed_files | expected_signature.modified_sources.keys()))
+            # TODO: Provide change descriptions
             raise CacheInvalidationException(
-                summary=f"Detected {len(change_descriptions)} changes to uncommited files", 
-                full_message=tuple(change_descriptions)
+                summary=f"Detected {len(all_changed_files)} changes to uncommited files", 
+                full_message=tuple(map(str, all_changed_files))
             )
         # The signatures should match at this point
         assert expected_signature == actual_signature
@@ -587,7 +576,7 @@ class DevelopmentJar(PaperJar):
             # NOTE: We're going to allow directories, in case they are untracked by git
             #
             # In that case, we don't respect gitignore and hash everything indiscriminately
-            modified_sources={p: hash_file(Path(self.git_directory), hash_dir_as_repo=True) for p in self.detect_changed_files()},
+            modified_sources={p: hash_file(Path(self.git_directory, p), hash_dir_as_repo=True, when_removed="REMOVED") for p in self.detect_changed_files()},
         )
 
     @property
@@ -681,7 +670,7 @@ def detect_changed_files(repo: pygit2.Repository, repo_path: Path) -> Iterator[P
                     if not detected_modification:
                         raise AssertionError(f"Unable to find git's claimed modification (flags={flags:04x}): {target_path}")
 
-def hash_file(target: Path, *, hash_dir_as_repo: bool = False) -> str:
+def hash_file(target: Path, *, hash_dir_as_repo: bool = False, when_removed: Optional[str] = None) -> str:
     m = hashlib.sha256()
     try:
         with open(target, 'rb') as f:
@@ -700,4 +689,9 @@ def hash_file(target: Path, *, hash_dir_as_repo: bool = False) -> str:
             m.update(head.target.raw)
         else:
             m.update(b"NONE")
+    except FileNotFoundError:
+        if when_removed is None:
+            raise  # Removal is error by default
+        else:
+            return when_removed
     return m.hexdigest()
