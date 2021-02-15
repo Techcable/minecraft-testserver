@@ -289,6 +289,7 @@ def process_run(ctx, desired_jar: PaperJar, *, dry_run: bool, **kwargs):
     print()
     print()
     # TODO: Handle Interrupts
-    run([ctx.jvm.java_bin, *ctx.java_args, "-jar", desired_jar.resolved_path, "--nogui"], cwd="server")
+    # NOTE: We must use `Path.resolve` because `OfficialPaperServer` returns relative paths :(
+    run([ctx.jvm.java_bin, *ctx.java_args, "-jar", desired_jar.resolved_path.resolve(), "--nogui"], cwd="server")
 
 minecraft()
