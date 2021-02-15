@@ -25,5 +25,4 @@ requireDependency requests
 # I like libgit2
 requireDependency pygit2
 
-
-python3 -m mcserver
+python3 -m mcserver "$@"
