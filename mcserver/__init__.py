@@ -290,7 +290,7 @@ class DevJarSignature:
         return DevJarSignature(
             jar_hash=data['jar_hash'],
             source_commit=data['source_commit'],
-            modified_sources={Path(s): h for p, h in data['modified_sources'].items()}
+            modified_sources={Path(p): h for p, h in data['modified_sources'].items()}
         )
 
 _MANIFEST_VERSION_PATTERN = re.compile("Implementation-Version: (\\S.*)")
@@ -452,11 +452,7 @@ class DevelopmentJar(PaperJar):
             repos.append((pygit2.Repository(str(api_repo_path)), api_repo_path))
         changed = []
         for repo, repo_path in repos:
-            for file, flags in repo.status().items():
-                if flags not in (pygit2.GIT_STATUS_CURRENT, pygit2.GIT_STATUS_IGNORED):
-                    full_path = Path(repo_path, file)
-                    # TODO: Walk ?
-                    changed.append(full_path.relative_to(self.git_directory))
+            changed.extend(p.relative_to(self.git_directory) for p in detect_changed_files(repo, repo_path))
         changed.sort()
         return changed
 
@@ -552,7 +548,7 @@ class DevelopmentJar(PaperJar):
             # so even if they hash the same the sources on disk do not necessarily correspond to the jar
             raise CacheInvalidationException("Compiled jar changed on disk (hash)")
         if expected_signature.source_commit != self.current_commit:
-            repo = self.open_rpeo()
+            repo = self.open_repo()
             actual_commit = DevCommit.revparse(repo, self.current_commit, strict=False)
             expected_commit = DevCommit.revparse(repo, expected_signature.source_commit, strict=False)
             raise CacheInvalidationException(f"Mismatched commits for {repo_name}", full_message=[
@@ -566,7 +562,7 @@ class DevelopmentJar(PaperJar):
         if changed_files != expected_signature.modified_sources.keys():
             all_changed_files = changed_files | expected_signature.modified_sources.keys()
             change_descriptions = []
-            for name in sorted(set(changed_files)):
+            for name in sorted(set(all_changed_files)):
                 if name not in expected_signature.modified_sources:
                     assert name in actual_signature.modified_sources
                     descr = "Added"
@@ -575,6 +571,7 @@ class DevelopmentJar(PaperJar):
                     descr = "Removed"
                 else:
                     descr = "Modified"
+                descr += ":"
                 change_descriptions.append(f"{descr:10} {name}")
             raise CacheInvalidationException(
                 summary=f"Detected {len(change_descriptions)} changes to uncommited files", 
@@ -590,7 +587,7 @@ class DevelopmentJar(PaperJar):
             # NOTE: We're going to allow directories, in case they are untracked by git
             #
             # In that case, we don't respect gitignore and hash everything indiscriminately
-            modified_sources={p: hash_file(Path(self.git_directory), recurse_dir=True) for p in self.detect_changed_files()},
+            modified_sources={p: hash_file(Path(self.git_directory), hash_dir_as_repo=True) for p in self.detect_changed_files()},
         )
 
     @property
@@ -644,27 +641,63 @@ class CacheInvalidationException(PaperVersionException):
             else:
                 print()
 
+def detect_changed_files(repo: pygit2.Repository, repo_path: Path) -> Iterator[Path]:
+    submodules = repo.listall_submodules()
+    for file, flags in repo.status().items():
+        if flags not in (pygit2.GIT_STATUS_CURRENT, pygit2.GIT_STATUS_IGNORED):
+            target_path = Path(repo_path, file)
+            if not target_path.is_dir():
+                yield target_path
+            else:
+                relative_path = target_path.relative_to(repo_path)
+                # NOTE: Special treatment for sub-modules
+                if str(relative_path) in submodules:
+                    sub_repo = pygit2.Repository(target_path)  # TODO: What if it's no longer a repository?
+                    # Mark the subrepo itself as modified. It has additional commit metadata
+                    # that might have changed
+                    yield target_path
+                    # Detect any modified files within the sub-repo
+                    # NOTE: This is faster than plain hashing because it implicitly takes advantage of
+                    # the tracking git has already done.
+                    yield from detect_changed_files(sub_repo, target_path)
+                else:
+                    # Not a submodule: just mark all (non-ignored) subfiles as changed
+                    #
+                    # NOTE: We do not yield the directory itself because git ignores that.
+                    # There is no extra metadata to add in that case.
+                    detected_modification = False
+                    for dirpath, dirnames, filenames in os.walk(target_path):
+                        relative_dirpath = Path(dirpath).relative_to(repo_path)
+                        for name in filenames:
+                            if not repo.path_is_ignored(str(Path(relative_dirpath, name))):
+                                yield Path(dirpath, name)
+                                detected_modification = True
+                        for sub_dir in list(dirnames):
+                            if repo.path_is_ignored(str(Path(relative_dirpath, sub_dir))):
+                                dirnames.remove(sub_dir)
+                            else:
+                                yield Path(dirpath, sub_dir)
+                                detected_modification = True
+                    if not detected_modification:
+                        raise AssertionError(f"Unable to find git's claimed modification (flags={flags:04x}): {target_path}")
 
-
-def hash_file(target: Path, *, recurse_dir: bool = False) -> str:
+def hash_file(target: Path, *, hash_dir_as_repo: bool = False) -> str:
     m = hashlib.sha256()
     try:
         with open(target, 'rb') as f:
-            while (buffer := f.read(4096)):
+            while (buffer := f.read(8192)):
                 m.update(buffer)
     except IsADirectoryError:
-        if not recurse_dir:
+        if not hash_dir_as_repo:
             raise
-        # When recursing dirs, hash a sorted list of file hashes + directory names
-        for root, dirs, files in os.walk(target):
-            # NOTE: Must sort for consistent order
-            files.sort()
-            dirs.sort()
-            for name in sorted(files):
-                m.update(bytes.fromhex(hash_file(Path(root, name))))
-                m.update(b",")
-            # Include directory names, in case that somehow affects things
-            for name in dirs:
-                m.update(name.encode('utf-8'))
-                m.update(b",")
+        try:
+            repo = pygit2.Repository(target)
+        except GitError:
+            raise ValueError(f"Unable to hash as git repo: {target}")
+        # Just hash the current commit head
+        head = repo.head
+        if head is not None:
+            m.update(head.target.raw)
+        else:
+            m.update(b"NONE")
     return m.hexdigest()
