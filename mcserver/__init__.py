@@ -413,7 +413,7 @@ class OfficialPaperJar(PaperJar):
         assert hash_file(self.resolved_path) == info.download_hash
 
     def describe(self):
-        return f"Paper-{self.build_number}"
+        return f"Paper-{self.build_number}-official"
 
     @property
     def resolved_path(self) -> Path:
@@ -599,11 +599,19 @@ class DevelopmentJar(PaperJar):
         return pygit2.Repository(str(self.git_directory))
 
     def describe(self) -> str:
+        full_commit_id = self.current_commit
+        try:
+            # NOTE: We want to use the short id if at all possible
+            commit_id = DevCommit.revparse(self.open_repo(), full_commit_id, strict=False).short_id
+        except pygit2.GitError:
+            commit_id = full_commit_id
         # NOTE: we're describing the *intended* version for this repo
-        descr = f"Paper-{self.current_commit}"
+        parts = ["Paper", commit_id]
         if self.dirty:
-            descr += "-dirty"
-        return descr
+            parts.append("dirty")
+        else:
+            parts.append("dev")
+        return '-'.join(parts)
 
     @property
     def resolved_path(self) -> Path:

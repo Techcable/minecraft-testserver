@@ -149,25 +149,35 @@ def update_plugins(ignores: list[str], force: bool):
             if not refresh:
                 print(f"  - Already exists: {jar}")
 
+# NOTE: Despite the claim of 'extremely low overhead', it's too expensive to enable 'alloc_object_counting'
+# by default. It simply brings startup to a standstill (we even get a tps warning immediately on boot).
+#
+# On the other hand, sampling and monitors profiling seems to have acceptible overhead
+DEFAULT_YOURKIT_MODES = frozenset({'sampling', 'monitors'})
+YOURKIT_CPU_MODES = frozenset({'sampling', 'call_counting', 'tracing', 'async_sampling_cpu'})
+VALID_YOURKIT_MODES  = DEFAULT_YOURKIT_MODES | {'alloc_object_counting', 'alloceach', 'exceptions'} | YOURKIT_CPU_MODES
+YOURKIT_ALLOC_RECORD_FREQUENCY = 10
+"""When 'alloceach' is enabled, record every nth allocations (by default every 10th)"""
+
 # NOTE: This is a workaround for the subcommands not working right -_-
 @minecraft.group('run', invoke_without_command=True)
-@click.option('--ram', help="The amount of RAM to use", default='1G')
+@click.option('--ram', help="The amount of RAM to use", default='1G', show_default=True)
 @click.option('--yourkit', is_flag=True, help="Attach a yourkit profiling agent")
+@click.option(
+    '--yourkit-delay', type=int, default=10_000, show_default=True,
+    help="If yourkit is enabled, the delay before starting profiling (helps avoid profiling plugin/server startup)"
+)
+@click.option(
+    '--yourkit-mode', 'yourkit_modes', type=click.Choice(VALID_YOURKIT_MODES), multiple=True, default=tuple(DEFAULT_YOURKIT_MODES), 
+    show_default=True, help="If yourkit is enabled, the profiling mode(s) to automatically enable on startup"
+)
 @click.option('--dry-run', is_flag=True, help="Do a dry run, compiling and printing startup flags without actually running")
-@click.option('--minecraft-version', '--mc', default=str(max(MinecraftVersion.list_all())),
+@click.option('--minecraft-version', '--mc', default=str(max(MinecraftVersion.list_all())), show_default=True,
     help="The minecraft version to run (defaults to latest)")
 @click.pass_context
-def run_server(ctx, ram, yourkit, dry_run, minecraft_version):
+def run_server(ctx, ram, yourkit, dry_run, minecraft_version, yourkit_delay, yourkit_modes):
     """Actually runs the server"""
     ctx.jvm = ctx.parent.jvm # This should auto-inherit -_-
-    java_args = [f"-Xms{ram}", f"-Xmx{ram}"]
-    if yourkit:
-        if not YOURKIT_PATH.is_file():
-            raise ClickException(f"Missing yourkit profiler: {YOURKIT_PATH}")
-        java_args.append(f"-agentpath:{YOURKIT_PATH}=exceptions=disable,delay=10000")
-    # Extend with the JVM flags
-    java_args.extend(JVM_FLAGS)
-    ctx.java_args = java_args
     try:
        ctx.minecraft_version = MinecraftVersion(minecraft_version)
     except ValueError:
@@ -266,7 +276,7 @@ def official(ctx, build_number):
 
 @run_server.resultcallback()
 @click.pass_context
-def process_run(ctx, desired_jar: PaperJar, *, dry_run: bool, **kwargs):
+def process_run(ctx, desired_jar: PaperJar, *, dry_run: bool, ram: str, yourkit_modes: tuple[str, ...], yourkit: bool, yourkit_delay: int, **kwargs):
     # Ensure all plugins exist
     assert isinstance(desired_jar, PaperJar), f"Given jar: {desired_jar!r}"
     assert isinstance(ctx, click.Context)
@@ -277,7 +287,40 @@ def process_run(ctx, desired_jar: PaperJar, *, dry_run: bool, **kwargs):
             config.check()
         except plugins.PluginError as e:
             raise ClickException(e)
-    java_args = ctx.java_args
+    # Determine process arguments
+    java_args = [f"-Xmx{ram}", f"-Xms{ram}"]
+    yourkit_options = {}
+    if len(enabled_cpu_modes := (set(yourkit_modes) & YOURKIT_CPU_MODES)) > 1:
+        print("WARNING: Enabled multiple cpu profiling modes:")
+        for index, enabled_mode in enumerate(list(enabled_cpu_modes)):
+            print(' ' * 4, f"{index + 1}. {enabled_mode}", space='')
+        print("WARNING: This is possibly redundant")
+    # Treat delay of '0' as disabling the delay completely
+    if yourkit_delay == 0:
+        del yourkit_options['delay']
+    else:
+        yourkit_options['delay'] = yourkit_delay
+    for mode in yourkit_modes:
+        if mode == 'alloceach':
+            yourkit_options['alloceach'] = YOURKIT_ALLOC_RECORD_FREQUENCY
+        elif mode == 'exceptions':
+            yourkit_options['exceptions'] = 'on'
+        else:
+            yourkit_options[mode] = None
+    # Give the yourkit process a nicer name
+    yourkit_options['sessionname'] = desired_jar.describe()
+    if yourkit:
+        if not YOURKIT_PATH.is_file():
+            raise ClickException(f"Missing yourkit profiler: {YOURKIT_PATH}")
+        assert yourkit_options
+        # Actually append options and agent to path
+        yourkit_opt_string = ','.join(f"{name}={val}" if val else name for name, val in yourkit_options.items())
+        java_args.append(f"-agentpath:{YOURKIT_PATH}={yourkit_opt_string}")
+    # Extend with our magic set of JVM flags
+    java_args.extend(JVM_FLAGS)
+    #
+    # ***** Print info *****
+    #
     print(f"Minecraft version: {ctx.minecraft_version}")
     print(f"Server version: {desired_jar.describe()}")
     if dry_run:
@@ -293,6 +336,6 @@ def process_run(ctx, desired_jar: PaperJar, *, dry_run: bool, **kwargs):
     print()
     # TODO: Handle Interrupts
     # NOTE: We must use `Path.resolve` because `OfficialPaperServer` returns relative paths :(
-    run([ctx.jvm.java_bin, *ctx.java_args, "-jar", desired_jar.resolved_path.resolve(), "--nogui"], cwd="server")
+    run([ctx.jvm.java_bin, *java_args, "-jar", desired_jar.resolved_path.resolve(), "--nogui"], cwd="server")
 
 minecraft()
