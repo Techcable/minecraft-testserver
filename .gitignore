@@ -4,5 +4,10 @@
 # Ignore internal cache
 cache
 
+# Ignore crash reports & heap dumps
+server/crash-reports
+server/*.hprof
+server/*.hprof.idom
+
 # Python
 __pycache__
